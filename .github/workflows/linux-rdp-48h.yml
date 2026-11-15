@@ -1,0 +1,1503 @@
+name: Linux Desktop 48h (Tailscale + xrdp)
+
+# ---------------------------------------------------------------------------
+#  48 ساعت دسکتاپ لینوکس (XFCE) که از طریق Tailscale با mstsc وصل می‌شوی
+#  سقف هر جاب در GitHub ۶ ساعت است، پس ۹ جاب پشت سر هم زنجیر شده‌اند:
+#      9 × 320 دقیقه = 2880 دقیقه = 48 ساعت
+#  هر جاب یک ماشین تازه است، ولی چون hostname ثابت است IP تیل‌اسکیل
+#  معمولاً همان می‌ماند. بین دو جاب ~۲ دقیقه قطعی هست (ماشین عوض می‌شود).
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes_per_leg:
+        description: "دقیقه در هر جاب (حداکثر ۳۵۰) — ۹ جاب × ۳۲۰ = ۴۸ ساعت"
+        required: false
+        default: "320"
+
+concurrency:
+  group: linux-desktop-48h
+  cancel-in-progress: false
+
+env:
+  TS_HOSTNAME: linux-desktop
+  RDP_USER: rdpuser
+  TS_LEGS: "9"
+
+jobs:
+  leg-01:
+    name: "Leg 01/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: "Leg 01 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 01 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 01/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 01 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 01 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 01/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 01 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-02:
+    name: "Leg 02/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-01
+
+    steps:
+      - name: "Leg 02 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 02 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 02/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 02 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 02 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 02/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 02 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-03:
+    name: "Leg 03/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-02
+
+    steps:
+      - name: "Leg 03 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 03 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 03/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 03 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 03 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 03/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 03 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-04:
+    name: "Leg 04/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-03
+
+    steps:
+      - name: "Leg 04 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 04 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 04/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 04 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 04 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 04/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 04 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-05:
+    name: "Leg 05/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-04
+
+    steps:
+      - name: "Leg 05 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 05 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 05/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 05 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 05 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 05/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 05 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-06:
+    name: "Leg 06/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-05
+
+    steps:
+      - name: "Leg 06 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 06 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 06/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 06 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 06 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 06/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 06 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-07:
+    name: "Leg 07/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-06
+
+    steps:
+      - name: "Leg 07 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 07 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 07/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 07 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 07 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 07/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 07 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-08:
+    name: "Leg 08/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-07
+
+    steps:
+      - name: "Leg 08 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 08 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 08/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 08 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 08 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 08/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 08 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
+  leg-09:
+    name: "Leg 09/9 — Linux desktop"
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    needs: leg-08
+
+    steps:
+      - name: "Leg 09 — 1) نصب XFCE + xrdp"
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RDP_PASSWORD:-}" ]; then
+            echo "::error::Secret RDP_PASSWORD تعریف نشده است."
+            exit 1
+          fi
+          if [ "${#RDP_PASSWORD}" -lt 12 ]; then
+            echo "::error::رمز RDP باید حداقل ۱۲ کاراکتر باشد."
+            exit 1
+          fi
+
+          # --- کاربر دسکتاپ
+          if ! id -u "${RDP_USER}" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "${RDP_USER}"
+          fi
+          # here-string تا رمزهای شامل کاراکترهای خاص (غیر از :) هم سالم بمانند
+          sudo chpasswd <<< "${RDP_USER}:${RDP_PASSWORD}"
+          sudo usermod -aG sudo "${RDP_USER}"
+          echo "${RDP_USER} ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/90-${RDP_USER}" >/dev/null
+          sudo chmod 440 "/etc/sudoers.d/90-${RDP_USER}"
+
+          # --- بسته‌ها
+          # نکته: xorgxrdp صریحاً لازم است (در بعضی نسخه‌ها فقط Recommends است و اگر
+          # --no-install-recommends بدهیم، xrdp بدون درایور Xorg بالا می‌آید و
+          # نشست کاربر ساخته نمی‌شود). recommends را هم حذف نمی‌کنیم.
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            xrdp xorgxrdp xfce4 xfce4-terminal dbus-x11 x11-xserver-utils x11-utils
+
+          # --- نشست XFCE برای کاربر
+          echo "xfce4-session" | sudo tee "/home/${RDP_USER}/.xsession" >/dev/null
+          sudo chown "${RDP_USER}:${RDP_USER}" "/home/${RDP_USER}/.xsession"
+
+          # --- startwm.sh جایگزین (رفع صفحهٔ سیاه در Ubuntu 22.04/24.04)
+          sudo tee /etc/xrdp/startwm.sh >/dev/null <<'STARTWM'
+          #!/bin/sh
+          if [ -r /etc/profile ]; then . /etc/profile; fi
+          if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+          export XDG_SESSION_TYPE=x11
+          export XDG_CURRENT_DESKTOP=XFCE
+          export XDG_SESSION_DESKTOP=xfce
+          unset DBUS_SESSION_BUS_ADDRESS
+          unset XDG_RUNTIME_DIR
+          exec dbus-launch --exit-with-session /usr/bin/xfce4-session
+          STARTWM
+          sudo chmod 755 /etc/xrdp/startwm.sh
+
+          # --- گواهی SSL و راه‌اندازی سرویس
+          sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true
+          sudo systemctl enable xrdp >/dev/null 2>&1 || true
+          sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+
+          for i in $(seq 1 40); do
+            if ss -lnt 2>/dev/null | grep -q '127.0.0.1:3389\|0.0.0.0:3389\|:3389'; then
+              echo "xrdp روی پورت 3389 گوش می‌دهد."
+              break
+            fi
+            sleep 1
+          done
+          if ! ss -lnt | grep -q ':3389'; then
+            echo "::error::xrdp بالا نیامد"
+            sudo systemctl status xrdp --no-pager || true
+            sudo journalctl -u xrdp -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "نسخهٔ xrdp: $(xrdp --version 2>&1 | head -n1)"
+
+      - name: "Leg 09 — 2) نصب و اتصال Tailscale"
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAILSCALE_AUTHKEY:-}" ]; then
+            echo "::error::Secret TAILSCALE_AUTHKEY تعریف نشده است."
+            exit 1
+          fi
+
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo systemctl enable --now tailscaled || true
+          for i in $(seq 1 20); do
+            sudo tailscale status >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # نکته: روی لینوکس --unattended لازم نیست (سرویس سیستمی همیشه بالاست)
+          sudo tailscale up \
+            --authkey="${TAILSCALE_AUTHKEY}" \
+            --hostname="${TS_HOSTNAME}" \
+            --accept-dns=false \
+            --accept-routes \
+            --timeout=120s
+
+          TS_IP=""
+          for i in $(seq 1 30); do
+            TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+            [ -n "$TS_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$TS_IP" ]; then
+            echo "::error::IP تیل‌اسکیل به دست نیامد"
+            sudo tailscale status || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================================="
+          echo "   >>> دسکتاپ لینوکس آماده است — جاب 09/9 <<<"
+          echo "   Tailscale IP : $TS_IP"
+          echo "   Port         : 3389 (xrdp)"
+          echo "   Username     : ${RDP_USER}"
+          echo "   Password     : (Secret RDP_PASSWORD)"
+          echo "   اتصال        : mstsc /v:$TS_IP"
+          echo "=================================================="
+          echo "RDP_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          {
+            echo "### جاب 09 از 9 بالا آمد ✅"
+            echo ""
+            echo "| مورد | مقدار |"
+            echo "|---|---|"
+            echo "| Tailscale IP | \`$TS_IP\` |"
+            echo "| Username | \`${RDP_USER}\` |"
+            echo "| Port | \`3389\` |"
+            echo ""
+            echo "جاب بعدی به‌صورت خودکار اجرا می‌شود تا زنجیرهٔ ۴۸ ساعته کامل شود."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Leg 09 — 3) زنده نگه داشتن (320 دقیقه)"
+        env:
+          MINUTES_INPUT: ${{ inputs.minutes_per_leg }}
+        run: |
+          set -uo pipefail
+          M=${MINUTES_INPUT:-320}
+          case "$M" in ''|*[!0-9]*) M=320 ;; esac
+          if [ "$M" -gt 350 ]; then M=350; fi
+          if [ "$M" -lt 1 ]; then M=1; fi
+
+          echo "جاب 09/9 — $M دقیقه روشن می‌ماند."
+          for i in $(seq 1 "$M"); do
+            sleep 60
+            if [ $(( i % 20 )) -eq 0 ]; then
+              TS_IP=$(sudo tailscale ip -4 2>/dev/null | head -n1 || true)
+              if [ -z "$TS_IP" ]; then
+                echo "[$i/$M] تیل‌اسکیل قطع است — تلاش برای اتصال مجدد"
+                sudo tailscale up --accept-dns=false --accept-routes --timeout=60s || true
+              fi
+              if ! ss -lnt 2>/dev/null | grep -q ':3389'; then
+                echo "[$i/$M] xrdp خوابیده — ری‌استارت"
+                sudo systemctl restart xrdp || sudo /etc/init.d/xrdp restart || true
+              fi
+              echo "[$i/$M] alive — ts=$TS_IP — $(date -u +%H:%M:%SZ)"
+            fi
+          done
+          echo "جاب 09 تمام شد؛ جاب بعدی زنجیره شروع می‌شود."
